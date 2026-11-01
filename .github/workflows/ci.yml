@@ -1,0 +1,23 @@
+name: ci
+
+# The gates (ci/gates.sh): generate both services with tacplus at the floor their tacplus.yaml declare,
+# nothing generated tracked, build and test every crate, and the wedge's real-kernel tests in a container.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      # prost-wkt-types' build script and the wedge's CRI client (wedge/build.rs) run protoc.
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler jq
+      - run: ci/gates.sh

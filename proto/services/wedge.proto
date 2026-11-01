@@ -1,0 +1,128 @@
+// chaos-wedge: the only privileged part of tacplus's chaos system (tacplus-dev/chaos#1).
+//
+// One per node per fleet (a DaemonSet in the fleet's namespace, #1 Q1): it trusts only its own fleet's
+// kernel, so its caller's fleet is its own. Whatever it is asked, it can only do what it was built for:
+//
+// - a closed, typed API: the calls below and nothing else. No exec, no command line, interface name,
+//   selector or container id from the caller: every parameter is a number or a name it resolves itself;
+// - hard bounds on every parameter, compiled in (policy/src/bounds.rs); out of bound is refused;
+// - it verifies the target itself: it resolves the pod on its own node through the container runtime
+//   and refuses unless the pod's namespace is its fleet's (nsproxy's labels, read from the namespace)
+//   and the pod is not excluded (policy/src/exclusion.rs);
+// - auto-revert: every fault is written to the node's journal before it is applied, and reverted at its
+//   end by the wedge's own timer, whether the controller is alive or not; a starting wedge reverts what
+//   the journal holds before it serves.
+//
+// Auth is every tacplus S2S call's: server TLS plus a kernel-signed token, never mTLS; the generated
+// authorizer admits chaos-controller only.
+
+syntax = "proto3";
+
+package chaoswedge;
+
+import "sys/spec.proto";
+import "services/chaosv1.proto";
+
+option (spec.service) = {name: "chaos-wedge"};
+
+// Config is delivered by the kernel at startup and on every change; the operator renders it from the
+// fleet's uni-config (operator#17). It can only narrow what the wedge does: the exclusion lists add to
+// the compiled-in ones, and each bound, when set, can only tighten the compiled-in one.
+message Config {
+  option (spec.grpc_config) = {service_name: "chaos-wedge"};
+
+  // fleet is the deployment this wedge serves (nsproxy's tacplus.dev/deployment label). Every call's
+  // tag.fleet must equal it, and every target's namespace must carry it.
+  string fleet = 1 [(spec.assert_max_size) = 63];
+  // exclude_namespaces and exclude_services add to the compiled-in exclusion list.
+  repeated string exclude_namespaces = 2 [(spec.assert_max_size) = 64, (spec.assert_element_max_size) = 63];
+  repeated string exclude_services = 3 [(spec.assert_max_size) = 64, (spec.assert_element_max_size) = 63];
+  // max_duration_s, max_latency_ms, max_loss_pct and max_memory_pct_of_limit tighten the compiled-in
+  // bounds when non-zero; a value above the compiled-in bound is ignored (the compiled one holds).
+  uint32 max_duration_s = 4;
+  uint32 max_latency_ms = 5;
+  uint32 max_loss_pct = 6;
+  uint32 max_memory_pct_of_limit = 7;
+  // max_live_faults is the most faults live on this node at once (compiled-in ceiling 4).
+  uint32 max_live_faults = 8;
+}
+
+// WedgeState is this service's state root in the kernel's cluster. Empty: the wedge's only state is its
+// node's journal.
+message WedgeState {
+  option (spec.service_state) = {label: ["kernel"]};
+}
+
+// WedgeActor declares the topics the wedge publishes: the fault records and the trace.
+message WedgeActor {
+  option (spec.event_publish) = {topic_ref: "chaosv1.FaultEventBus.stream"};
+  option (spec.event_publish) = {
+    topic_ref: "eventbus.TraceEventBus.trace_events"
+    method_s2s: {auth_services: ["chaos-wedge"]}
+  };
+}
+
+message CreateNetworkDelayRequest {
+  chaosv1.FaultTag tag = 1;
+  chaosv1.Target target = 2;
+  uint32 latency_ms = 3;
+  uint32 jitter_ms = 4;
+  uint32 correlation_pct = 5;
+  uint32 duration_s = 6;
+}
+
+message CreatePacketLossRequest {
+  chaosv1.FaultTag tag = 1;
+  chaosv1.Target target = 2;
+  uint32 loss_pct = 3;
+  uint32 correlation_pct = 4;
+  uint32 duration_s = 5;
+}
+
+message CreateContainerKillRequest {
+  chaosv1.FaultTag tag = 1;
+  chaosv1.Target target = 2;
+}
+
+message CreateStressRequest {
+  chaosv1.FaultTag tag = 1;
+  chaosv1.Target target = 2;
+  uint32 cpu_workers = 3;
+  uint32 cpu_load_pct = 4;
+  uint32 memory_pct_of_limit = 5;
+  uint32 duration_s = 6;
+}
+
+// DeleteFaultRequest reverts a live fault early, by its id (the controller's pause).
+message DeleteFaultRequest {
+  chaosv1.FaultTag tag = 1;
+}
+
+message ListFaultsRequest {}
+
+message ListFaultsResponse {
+  repeated chaosv1.FaultReply faults = 1 [(spec.assert_max_size) = 4];
+}
+
+service Wedge {
+  option (spec.service_s2s) = {auth_services: ["chaos-controller"]};
+
+  // CreateNetworkDelay adds netem delay to the target pod's eth0 until duration_s has passed.
+  rpc CreateNetworkDelay(CreateNetworkDelayRequest) returns (chaosv1.FaultReply);
+  // CreatePacketLoss adds netem loss to the target pod's eth0 until duration_s has passed.
+  rpc CreatePacketLoss(CreatePacketLossRequest) returns (chaosv1.FaultReply);
+  // CreateContainerKill stops one container of the target pod at once (one-shot: the kubelet restarts it).
+  rpc CreateContainerKill(CreateContainerKillRequest) returns (chaosv1.FaultReply);
+  // CreateStress runs CPU and memory load in the target container's cgroup until duration_s has passed.
+  rpc CreateStress(CreateStressRequest) returns (chaosv1.FaultReply);
+  // DeleteFault reverts a live fault now. Reverting a fault that is gone is success.
+  rpc DeleteFault(DeleteFaultRequest) returns (chaosv1.FaultReply);
+  // ListFaults lists the faults live on this node.
+  rpc ListFaults(ListFaultsRequest) returns (ListFaultsResponse) {
+    option (spec.method_collection) = {
+      mode: COLLECTION_MODE_SNAPSHOT,
+      order_by: ["start_unix_ms"],
+      max_items: 4
+    };
+  }
+}

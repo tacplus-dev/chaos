@@ -1,0 +1,111 @@
+// chaos-controller: schedules tacplus's chaos for one fleet (tacplus-dev/chaos#1).
+//
+// Namespace-scoped, in the fleet's namespace, with no privilege: a Role in the fleet's namespaces only
+// (pods get/list/watch/delete, events create). It does pod kills itself, through the Kubernetes API, and
+// asks the wedge on the target's node for everything else. One fault at a time per fleet; after each it
+// checks the target's service recovers, and starts no new round until it has.
+
+syntax = "proto3";
+
+package chaoscontroller;
+
+import "sys/spec.proto";
+import "services/chaosv1.proto";
+
+option (spec.service) = {name: "chaos-controller"};
+
+// Config is delivered by the kernel at startup and on every change; the operator renders it from the
+// fleet's uni-config (operator#17).
+message Config {
+  option (spec.grpc_config) = {service_name: "chaos-controller"};
+
+  // fleet is this deployment's name (nsproxy's tacplus.dev/deployment label).
+  string fleet = 1 [(spec.assert_max_size) = 63];
+  // namespaces are the fleet's namespaces: the deployment namespace and its tenant namespaces. The
+  // controller's Role covers these and nothing else.
+  repeated string namespaces = 2 [(spec.assert_max_size) = 256, (spec.assert_element_max_size) = 63];
+  // interval_s is the time between rounds.
+  uint32 interval_s = 3 [(spec.default_int) = 900, (spec.assert_ge) = 60];
+  // The levels: pods (pod kills) on by default; network and stress opt-in (#1 Q4: allowed in
+  // production too). Members and nodes come later.
+  bool level_pods = 4 [(spec.default_bool) = true];
+  bool level_network = 5;
+  bool level_stress = 6;
+  // paused stops scheduling and reverts every live fault.
+  bool paused = 7;
+  // recovery_timeout_s bounds the wait for the target's service to be Ready again.
+  uint32 recovery_timeout_s = 8 [(spec.default_int) = 120, (spec.assert_ge) = 10];
+  // exclude_services adds to the compiled-in exclusion list.
+  repeated string exclude_services = 9 [(spec.assert_max_size) = 64, (spec.assert_element_max_size) = 63];
+  // wedge_port is the port the wedge serves on, on its pod.
+  uint32 wedge_port = 10 [(spec.default_int) = 8443];
+}
+
+// ControllerState is this service's state root in the kernel's cluster. Empty: rounds are kept in
+// memory and on the record (chaosv1.FaultEvent).
+message ControllerState {
+  option (spec.service_state) = {label: ["kernel"]};
+}
+
+// ControllerActor declares the topics the controller publishes: the fault records and the trace.
+message ControllerActor {
+  option (spec.event_publish) = {topic_ref: "chaosv1.FaultEventBus.stream"};
+  option (spec.event_publish) = {
+    topic_ref: "eventbus.TraceEventBus.trace_events"
+    method_s2s: {auth_services: ["chaos-controller"]}
+  };
+}
+
+option (spec.grpc_s2s_client) = {service: "chaoswedge.Wedge"};
+
+// CreateRoundRequest asks for one round now (tests and seatrials). kind, when set, chooses the fault;
+// it must be one of the levels the Config switches on.
+message CreateRoundRequest {
+  chaosv1.FaultKind kind = 1;
+}
+
+// Round is one firing of the schedule: one fault on one target, and whether the target recovered.
+message Round {
+  string round = 1 [(spec.assert_max_size) = 64];
+  chaosv1.FaultReply fault = 2;
+  // service is the target's tacplus service.
+  string service = 3 [(spec.assert_max_size) = 63];
+  // recovery is OUTCOME_RECOVERED or OUTCOME_NOT_RECOVERED once known, else unspecified.
+  chaosv1.Outcome recovery = 4;
+  // skipped says why the round did nothing (no eligible target, paused, a service not recovered).
+  string skipped = 5 [(spec.assert_max_size) = 256];
+}
+
+message UpdateScheduleRequest {
+  bool paused = 1;
+}
+
+message ScheduleResponse {
+  bool paused = 1;
+  // reverted are the faults the pause reverted.
+  repeated chaosv1.FaultReply reverted = 2 [(spec.assert_max_size) = 4];
+}
+
+message ListRoundsRequest {}
+
+message ListRoundsResponse {
+  repeated Round rounds = 1 [(spec.assert_max_size) = 64];
+}
+
+service Controller {
+  // The callers are the fleet's: the fleet build admits the services that declare a client of it.
+  option (spec.service_s2s) = {auth_services_from_fleet: true};
+
+  // CreateRound runs one round now and returns once the fault is applied (recovery is checked after).
+  rpc CreateRound(CreateRoundRequest) returns (Round);
+  // UpdateSchedule pauses or resumes the schedule; a pause reverts every live fault through the wedge.
+  rpc UpdateSchedule(UpdateScheduleRequest) returns (ScheduleResponse);
+  // ListRounds lists the last rounds, newest first.
+  rpc ListRounds(ListRoundsRequest) returns (ListRoundsResponse) {
+    option (spec.method_collection) = {
+      mode: COLLECTION_MODE_SNAPSHOT,
+      order_by: ["round"],
+      max_items: 64
+    };
+  }
+}

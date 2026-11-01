@@ -1,0 +1,15 @@
+kind: service
+# The compiler line this repository builds with: the looper runs its latest patch.
+tacplus: "2.5"
+language: rust
+# The controller's own generation: its crate hosts the chaoscontroller package (and a client of the
+# wedge). Rust crate is <last segment>-model (chaoscontroller-model).
+pkg: com.github.tacplusdev.chaoscontroller
+output-dir: target/generated-sources
+src: ../proto
+# The fault records and the trace go to the eventbus broker.
+depends:
+  - eventbus
+header: |
+  Copyright (c) 2026 Jody Scott
+  SPDX-License-Identifier: Apache-2.0

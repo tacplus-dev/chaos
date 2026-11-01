@@ -1,0 +1,95 @@
+# Copyright (c) 2026 Jody Scott
+# SPDX-License-Identifier: Apache-2.0
+#
+# Nightly upstream watch (tacplus-dev/chaos#1, step 4).
+#
+# 1. chaos-upstream-watch (upstream-watch/) compares Chaos Mesh's releases newer than the pin in
+#    docs/chaos-mesh-survey.md with the survey's section 6 table, writes one suggestion file per new
+#    `### Added` changelog entry into $RUNNER_TEMP/suggestions, and records the compared releases in
+#    the survey (--update-survey), so the next night does not suggest them again.
+# 2. Each suggestion is filed into tacplus-dev/roadmap with `looper-suggest file`. That command comes
+#    from tacplus-dev/looper#50 and does not exist yet: until it does, this step FAILS (on purpose)
+#    whenever there is something to file, rather than dropping suggestions silently.
+# 3. If the survey changed, the update is proposed as a PR on branch upstream-watch/<new pin tag>.
+
+name: upstream-watch
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Compare Chaos Mesh releases with the survey
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo run --locked --manifest-path upstream-watch/Cargo.toml -- \
+            --survey docs/chaos-mesh-survey.md --out "$RUNNER_TEMP/suggestions" --update-survey
+
+      - name: File suggestions (looper-suggest, tacplus-dev/looper#50)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=("$RUNNER_TEMP"/suggestions/*.md)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No new Chaos Mesh features: nothing to file."
+            exit 0
+          fi
+          if ! command -v looper-suggest >/dev/null 2>&1; then
+            echo "::error title=looper-suggest not installed::${#files[@]} suggestion(s) to file, but 'looper-suggest' is not installed. It is added by tacplus-dev/looper#50; until then file them by hand from the job log below."
+            for f in "${files[@]}"; do
+              echo "----- $f"
+              cat "$f"
+            done
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            echo "Filing $f"
+            looper-suggest file "$f"
+          done
+
+      - name: Propose the survey update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- docs/chaos-mesh-survey.md; then
+            echo "Survey unchanged: no new releases."
+            exit 0
+          fi
+          tag=$(sed -n 's/.*Version surveyed:\*\* Chaos Mesh \*\*\([^*]*\)\*\*.*/\1/p' docs/chaos-mesh-survey.md | head -n1)
+          if [ -z "$tag" ]; then
+            echo "::error::could not read the new pin from docs/chaos-mesh-survey.md"
+            exit 1
+          fi
+          branch="upstream-watch/$tag"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # One proposal per pin: a branch already pushed is an open (or decided) proposal, never overwritten.
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "$branch is already proposed."
+            exit 0
+          fi
+          git switch -c "$branch"
+          git add docs/chaos-mesh-survey.md
+          git commit -m "Survey: record Chaos Mesh releases up to $tag (upstream watch)"
+          git push origin "$branch"
+          gh pr create --base "${{ github.event.repository.default_branch }}" --head "$branch" \
+            --title "Survey: Chaos Mesh releases up to $tag" \
+            --body "The nightly upstream watch compared Chaos Mesh releases newer than the previous pin and recorded them in docs/chaos-mesh-survey.md section 6 (new rows marked \"To survey\"). Each new \`Added\` entry was filed as a suggestion with \`looper-suggest file\`. Decide each one (adopt now / adopt later / not doing) and update the row's \"Where\" column."

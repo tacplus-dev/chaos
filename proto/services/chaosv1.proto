@@ -1,0 +1,109 @@
+// chaosv1: what the two chaos services share, the fault's identity and its audit record.
+//
+// tacplus's chaos system (tacplus-dev/chaos#1, design approved there 2026-11-01) has two services:
+// chaos-controller (services/controller.proto) schedules faults and does pod kills through the
+// Kubernetes API; chaos-wedge (services/wedge.proto), the only privileged part, does everything else
+// through a closed, typed API. Both put every action on the record as a FaultEvent (below), and every
+// call between them is a tacplus gRPC call, so it is in the event trace.
+
+syntax = "proto3";
+
+package chaosv1;
+
+import "sys/spec.proto";
+
+// Target names the container a fault acts on. Names only: the wedge resolves them on its own node
+// through the container runtime and never takes a container id, netns or cgroup from the caller.
+message Target {
+  string namespace = 1 [(spec.assert_max_size) = 63];
+  string pod = 2 [(spec.assert_max_size) = 253];
+  // container is the container's name in the pod; empty means the pod's first container.
+  string container = 3 [(spec.assert_max_size) = 63];
+}
+
+// FaultTag identifies one fault. The controller sets it; every reply and record echoes it, so triage
+// (fleet-seatrials#26) can match a failure to the fault behind it.
+message FaultTag {
+  string fleet = 1 [(spec.assert_max_size) = 63];
+  string round = 2 [(spec.assert_max_size) = 64];
+  string fault_id = 3 [(spec.assert_max_size) = 64];
+}
+
+enum FaultKind {
+  FAULT_KIND_UNSPECIFIED = 0;
+  FAULT_KIND_POD_KILL = 1;       // controller: delete the pod (Kubernetes API)
+  FAULT_KIND_CONTAINER_KILL = 2; // wedge: stop one container of a pod at once
+  FAULT_KIND_NETWORK_DELAY = 3;  // wedge: netem delay on the pod's eth0
+  FAULT_KIND_PACKET_LOSS = 4;    // wedge: netem loss on the pod's eth0
+  FAULT_KIND_STRESS = 5;         // wedge: CPU and memory load in the container's cgroup
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_INJECTED = 1;
+  OUTCOME_REVERTED = 2;
+  OUTCOME_REFUSED = 3;
+  OUTCOME_RECOVERED = 4;
+  OUTCOME_NOT_RECOVERED = 5;
+}
+
+// FaultParameters are a fault's parameters, the ones its kind uses (the rest are zero). Every one is a
+// number: no string a caller sends reaches a command. Their bounds are compiled into both services
+// (policy/src/bounds.rs); a value out of bound is refused, never clamped.
+message FaultParameters {
+  uint32 duration_s = 1;
+  uint32 latency_ms = 2;
+  uint32 jitter_ms = 3;
+  uint32 correlation_pct = 4;
+  uint32 loss_pct = 5;
+  uint32 cpu_workers = 6;
+  uint32 cpu_load_pct = 7;
+  uint32 memory_pct_of_limit = 8;
+  uint32 grace_period_s = 9;
+}
+
+// FaultReply is the wedge's answer to every fault call.
+message FaultReply {
+  FaultTag tag = 1;
+  FaultKind kind = 2;
+  Target target = 3;
+  int64 start_unix_ms = 4;
+  // end_unix_ms is when the wedge reverts the fault on its own (0 for a one-shot kill).
+  int64 end_unix_ms = 5;
+  Outcome outcome = 6;
+  // refusal says why, when outcome is OUTCOME_REFUSED.
+  string refusal = 7 [(spec.assert_max_size) = 512];
+}
+
+// FaultEvent is the audit record of one action on one fault: injected, reverted, refused, recovered or
+// not. Published by both services on the durable topic chaosv1.FaultEventBus.stream and kept (Jody,
+// 2026-11-01, #1 Q2: fault records are an audit log). trace_id (field 200, on every message) is the
+// trace_id of the call that started the fault, so a record and the call's ephemeral trace (tacplus#265)
+// meet through it. Triage reads this topic: RECOVERED is logged and ignored, anything else an incident.
+message FaultEvent {
+  option (spec.record) = {
+    key: "event_id",
+    owner: "fleet",
+    s2s: {auth_services: ["chaos-controller", "chaos-wedge"]}
+  };
+
+  string event_id = 1 [(spec.assert_max_size) = 64];
+  string fleet = 2 [(spec.assert_max_size) = 63];
+  // namespace is the target's namespace, one of the fleet's.
+  string namespace = 3 [(spec.assert_max_size) = 63, (spec.store_namespace) = true];
+  FaultTag tag = 4;
+  FaultKind kind = 5;
+  Target target = 6;
+  // service is the target's tacplus service (its pod's app.kubernetes.io/name label), when known.
+  string service = 7 [(spec.assert_max_size) = 63];
+  FaultParameters parameters = 8;
+  Outcome outcome = 9;
+  string refusal = 10 [(spec.assert_max_size) = 512];
+  int64 start_unix_ms = 11;
+  int64 end_unix_ms = 12;
+  // recorded_by is the service that recorded the action: chaos-controller or chaos-wedge.
+  string recorded_by = 13 [(spec.assert_max_size) = 63];
+  // node is the target's node, when the wedge recorded it.
+  string node = 14 [(spec.assert_max_size) = 253];
+  int64 recorded_unix_ms = 15;
+}

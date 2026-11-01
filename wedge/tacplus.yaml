@@ -1,0 +1,15 @@
+kind: service
+# The compiler line this repository builds with: the looper runs its latest patch.
+tacplus: "2.5"
+language: rust
+# The wedge's own generation: its crate hosts the chaoswedge package only, so the privileged binary
+# carries no other service's surface. Rust crate is <last segment>-model (chaoswedge-model).
+pkg: com.github.tacplusdev.chaoswedge
+output-dir: target/generated-sources
+src: ../proto
+# The fault records and the trace go to the eventbus broker.
+depends:
+  - eventbus
+header: |
+  Copyright (c) 2026 Jody Scott
+  SPDX-License-Identifier: Apache-2.0

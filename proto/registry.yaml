@@ -1,0 +1,12 @@
+# Managed by tacplus — do not edit IDs manually.
+registries:
+    - https://github.com/tacplus-dev/registry.git
+services:
+    - name: chaos-controller
+      id: 109
+      contract: https://github.com/tacplus-dev/chaos.git
+      visibility: public
+    - name: chaos-wedge
+      id: 110
+      contract: https://github.com/tacplus-dev/chaos.git
+      visibility: public

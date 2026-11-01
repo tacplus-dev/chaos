@@ -1,0 +1,31 @@
+[package]
+name = "chaos-controller"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "chaos-controller"
+path = "src/main.rs"
+
+[dependencies]
+chaoscontroller-model = { path = "target/generated-sources/model" }
+servicemanager = { path = "target/generated-sources/model/chassis/servicemanager" }
+logger = { path = "target/generated-sources/model/chassis/logger" }
+chaos-policy = { path = "../policy" }
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["transport"] }
+tracing = "0.1"
+async-trait = "0.1"
+serde_json = "1"
+rand = "0.8"
+# The Kubernetes API, in the fleet's namespaces only: pods (list, delete) and events (create).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+token = { path = "target/generated-sources/model/chassis/token" }
+key = { path = "target/generated-sources/model/chassis/key" }
+tokio-stream = { version = "0.1", features = ["net"] }

@@ -1,0 +1,8 @@
+[package]
+name = "chaos-policy"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The rules both chaos services enforce: the compiled-in bounds, the exclusion list and the fleet check."
+
+[dependencies]

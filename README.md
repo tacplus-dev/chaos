@@ -37,8 +37,9 @@ The compiled-in bounds ([policy/src/bounds.rs](policy/src/bounds.rs)), refused, 
 without one); `cpu_load_pct` 1–100; `memory_pct_of_limit` 1–50 (none without a memory limit); a pod kill's grace period 0–30 s; one
 live fault per pod, at most 4 per node. Config can only tighten them, and only add to the exclusion list
 ([policy/src/exclusion.rs](policy/src/exclusion.rs)): `kube-*` and the platform's namespaces, any namespace not labelled as the
-fleet's by nsproxy (`tacplus.dev/deployment`, `nsproxy.tacplus.dev/deployment`), `letsencrypt`, the chaos services, any pod that mounts
-a Kubernetes Secret volume (the fleet's secret material lives only in Secrets).
+fleet's by nsproxy (`tacplus.dev/deployment`, `nsproxy.tacplus.dev/deployment`), `letsencrypt`, the chaos services, any pod one of whose
+containers (running or not) mounts a volume that can hold a Secret: a `secret` volume, a `projected` one other than the service account
+token's, or any CSI volume (the fleet's secret material lives only in Secrets).
 
 The nightly **upstream watch** ([upstream-watch/](upstream-watch/), `.github/workflows/upstream-watch.yml`) compares Chaos Mesh's newer
 releases with the survey and writes a suggestion (Type: Resiliency) for each new `Added` feature, to be filed with tacplus-dev/looper#50's
@@ -70,8 +71,8 @@ chaos-controller only.
 |---|---|
 | `ListPodSandbox` (filter: the pod's namespace and name labels, state `SANDBOX_READY`) | is the target pod on this node |
 | `PodSandboxStatus` (verbose) | the sandbox's pid: `/proc/<pid>/ns/net` is the pod's network namespace |
-| `ListContainers` (filter: that sandbox, state `CONTAINER_RUNNING`) | the target container |
-| `ContainerStatus` (verbose) | its pid (for its cgroup and limits) and its mounts (does the pod hold a Secret) |
+| `ListContainers` (filter: that sandbox) | the pod's containers; the target is a running one |
+| `ContainerStatus` (verbose), for every container of the pod | the target's pid (for its cgroup and limits), and every container's mounts (does the pod hold a Secret) |
 | `StopContainer` (timeout 0) | `CreateContainerKill`: the only call that changes anything |
 
 ## Build and test

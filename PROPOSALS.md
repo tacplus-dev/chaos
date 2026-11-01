@@ -18,5 +18,10 @@ the looper then marks it `promoted` or `declined` here with the date.
 - **Rounds kept across a controller restart** (2026-11-01, #1): rounds and a pending recovery check live in the controller's
   memory; a restarted controller forgets a target that has not recovered (the record keeps it). Reading back the last
   `FaultEvent`s on start would close that.
+- **Wedge follow-ups from the #1 review** (2026-11-01, #1): a REVERTED record carries only the fault's duration, not its other
+  parameters (keep them in the journal entry); the cgroup path is read from `/proc/<pid>/cgroup`, which is relative to the wedge's
+  own cgroup namespace, so the DaemonSet must run in the host's cgroup namespace or stress fails closed (state it in operator#18's
+  manifest, or resolve the path from the runtime's spec); stress in a real cgroup is not covered by the container test (it needs a
+  writable cgroup v2 hierarchy).
 
 ## Promoted / declined

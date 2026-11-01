@@ -96,9 +96,10 @@ impl Journal {
     }
 }
 
-/// A fault id is a journal file name, so it must be a plain token.
+/// A fault id is a journal file name and part of its records' event_id, so it must be a plain token of
+/// at most 40 bytes.
 pub fn valid_fault_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !id.is_empty() && id.len() <= 40 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 #[cfg(test)]
@@ -142,6 +143,7 @@ mod tests {
         assert!(valid_fault_id("r12-f1_x"));
         assert!(!valid_fault_id("../etc"));
         assert!(!valid_fault_id(""));
-        assert!(!valid_fault_id(&"a".repeat(65)));
+        assert!(valid_fault_id(&"a".repeat(40)));
+        assert!(!valid_fault_id(&"a".repeat(41)));
     }
 }

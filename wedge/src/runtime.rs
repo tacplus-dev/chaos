@@ -6,8 +6,9 @@
 //!
 //! - `ListPodSandbox` (filter: the pod's namespace and name labels, state READY) — is the pod on this node;
 //! - `PodSandboxStatus` (verbose) — the sandbox's pid, whose network namespace is the pod's;
-//! - `ListContainers` (filter: that sandbox, state RUNNING) — the target container;
-//! - `ContainerStatus` (verbose) — its pid (for its cgroup) and its mounts (does it hold a Secret);
+//! - `ListContainers` (filter: that sandbox) — the pod's containers; the target is a running one;
+//! - `ContainerStatus` (verbose), for each — the target's pid (for its cgroup) and every container's mounts
+//!   (does the pod hold a Secret);
 //! - `StopContainer` (timeout 0) — `CreateContainerKill`, the one call that changes anything.
 //!
 //! A socket mounted read-only still allows every runtime call: the code is the boundary, so no other
@@ -21,7 +22,7 @@ use tonic::transport::{Channel, Endpoint, Uri};
 
 use crate::cri::runtime_service_client::RuntimeServiceClient;
 use crate::cri::{
-    ContainerFilter, ContainerState, ContainerStateValue, ContainerStatusRequest, ListContainersRequest, ListPodSandboxRequest,
+    ContainerFilter, ContainerState, ContainerStatusRequest, ListContainersRequest, ListPodSandboxRequest,
     PodSandboxFilter, PodSandboxState, PodSandboxStateValue, PodSandboxStatusRequest, StopContainerRequest,
 };
 
@@ -85,6 +86,19 @@ fn info_pid(info: &std::collections::HashMap<String, String>) -> Option<u32> {
     v.get("pid")?.as_u64().map(|p| p as u32)
 }
 
+/// Whether a mount's host path is a volume that can hold a Secret: a `secret` volume, a `projected` one
+/// other than the service account token's (`kube-api-access-*`, which every pod has), or any CSI volume
+/// (a secrets-store driver). Conservative on purpose: a pod wrongly excluded is safe.
+pub fn holds_secret(host_path: &str) -> bool {
+    if host_path.contains("/volumes/kubernetes.io~secret/") || host_path.contains("/volumes/kubernetes.io~csi/") {
+        return true;
+    }
+    match host_path.split_once("/volumes/kubernetes.io~projected/") {
+        Some((_, rest)) => !rest.starts_with("kube-api-access-"),
+        None => false,
+    }
+}
+
 /// The cgroup v2 directory of a process, from `/proc/<pid>/cgroup` (`0::/kubepods/...`).
 pub fn cgroup_dir(proc_root: &Path, cgroup_root: &Path, pid: u32) -> Option<PathBuf> {
     let text = fs::read_to_string(proc_root.join(pid.to_string()).join("cgroup")).ok()?;
@@ -133,8 +147,9 @@ impl Runtime for Cri {
         let containers = client
             .list_containers(ListContainersRequest {
                 filter: Some(ContainerFilter {
+                    // Every container of the pod, running or not: one that mounts a Secret excludes the pod
+                    // even while it is restarting.
                     pod_sandbox_id: sandbox.id.clone(),
-                    state: Some(ContainerStateValue { state: ContainerState::ContainerRunning as i32 }),
                     ..Default::default()
                 }),
             })
@@ -152,9 +167,10 @@ impl Runtime for Cri {
                 .map_err(|e| format!("ContainerStatus: {e}"))?
                 .into_inner();
             if let Some(s) = &st.status {
-                mounts_secret |= s.mounts.iter().any(|m| m.host_path.contains("/volumes/kubernetes.io~secret/"));
+                mounts_secret |= s.mounts.iter().any(|m| holds_secret(&m.host_path));
             }
-            if chosen.is_none() && (container.is_empty() || name == container) {
+            let running = c.state == ContainerState::ContainerRunning as i32;
+            if running && chosen.is_none() && (container.is_empty() || name == container) {
                 chosen = Some((name, c.id.clone(), info_pid(&st.info)));
             }
         }
@@ -211,6 +227,17 @@ mod tests {
             cgroup_dir(proc_root.path(), Path::new("/sys/fs/cgroup"), 42),
             Some(PathBuf::from("/sys/fs/cgroup/kubepods.slice/pod1.slice/cri-containerd-abc.scope"))
         );
+    }
+
+    #[test]
+    fn secret_volumes() {
+        let v = "/var/lib/kubelet/pods/u1/volumes";
+        assert!(holds_secret(&format!("{v}/kubernetes.io~secret/tls")));
+        assert!(holds_secret(&format!("{v}/kubernetes.io~projected/bundle")));
+        assert!(holds_secret(&format!("{v}/kubernetes.io~csi/vault/mount")));
+        assert!(!holds_secret(&format!("{v}/kubernetes.io~projected/kube-api-access-x7k2p")));
+        assert!(!holds_secret(&format!("{v}/kubernetes.io~configmap/config")));
+        assert!(!holds_secret("/var/lib/kubelet/pods/u1/etc-hosts"));
     }
 
     #[test]

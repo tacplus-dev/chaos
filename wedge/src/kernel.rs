@@ -7,8 +7,8 @@
 //! - netem runs `tc` (iproute2, in the image) with an argument list built here, in the pod's network
 //!   namespace (`setns` into `/proc/<pid>/ns/net` in the child before exec), on the interface `eth0`,
 //!   with the wedge's own qdisc handle, so a revert removes only what a wedge added.
-//! - stress runs this binary's own `stress` mode (src/stress.rs) as a child, moved into the target
-//!   container's cgroup so the load counts against its limits; the child also stops itself at its end.
+//! - stress runs this binary's own `stress` mode (src/stress.rs) as a child that joins the target
+//!   container's cgroup before it execs, so the load counts against its limits; it stops itself at its end.
 
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -177,27 +177,39 @@ impl Kernel for HostKernel {
     }
 
     async fn start_stress(&self, cgroup_dir: &Path, spec: StressSpec) -> Result<StressProcess, String> {
-        let child = Command::new(&self.self_exe)
-            .args([
-                "stress".to_string(),
-                spec.cpu_workers.to_string(),
-                spec.cpu_load_pct.to_string(),
-                spec.memory_bytes.to_string(),
-                spec.duration_s.to_string(),
-            ])
-            .spawn()
-            .map_err(|e| format!("start stress: {e}"))?;
+        // The child joins the target's cgroup itself, before it execs (writing "0" to cgroup.procs moves
+        // the writer), so everything it allocates is charged to the target, never to the wedge.
+        let procs = fs::OpenOptions::new()
+            .write(true)
+            .open(cgroup_dir.join("cgroup.procs"))
+            .map_err(|e| format!("open {}/cgroup.procs: {e}", cgroup_dir.display()))?;
+        let fd = procs.as_raw_fd();
+        let mut cmd = Command::new(&self.self_exe);
+        cmd.args([
+            "stress".to_string(),
+            spec.cpu_workers.to_string(),
+            spec.cpu_load_pct.to_string(),
+            spec.memory_bytes.to_string(),
+            spec.duration_s.to_string(),
+        ]);
+        // SAFETY: write(2) is async-signal-safe; it runs in the forked child before exec, on the fd opened
+        // above, which stays open until the spawn returns.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::write(fd, b"0".as_ptr().cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().map_err(|e| format!("start stress in {}: {e}", cgroup_dir.display()))?;
+        drop(procs);
         let pid = child.id();
         // Reap it whenever it ends, so its pid is not left a zombie.
         std::thread::spawn(move || {
             let mut child = child;
             let _ = child.wait();
         });
-        if let Err(e) = fs::write(cgroup_dir.join("cgroup.procs"), pid.to_string()) {
-            // SAFETY: plain kill(2) of the child just started.
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-            return Err(format!("move stress into {}: {e}", cgroup_dir.display()));
-        }
         let start_ticks = process_start_ticks(&self.proc_root, pid).ok_or("stress process vanished")?;
         Ok(StressProcess { pid, start_ticks })
     }

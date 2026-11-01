@@ -61,8 +61,11 @@ struct Inner {
     settings: Mutex<Settings>,
     journal: Mutex<Option<Journal>>,
     live: Mutex<BTreeMap<String, Live>>,
-    /// Serializes fault calls, so the checks and the apply of one are not interleaved with another's.
+    /// Serializes fault calls and reverts, so the checks and the apply of one are never interleaved with
+    /// another's, nor with a revert (whose slot is free only once its effect is gone).
     apply: tokio::sync::Mutex<()>,
+    /// Set by the shutdown: no fault is applied after it.
+    closing: std::sync::atomic::AtomicBool,
 }
 
 /// The wedge's handler. Cheap to clone: the state is shared.
@@ -112,6 +115,7 @@ impl Wedge {
                 journal: Mutex::new(None),
                 live: Mutex::new(BTreeMap::new()),
                 apply: tokio::sync::Mutex::new(()),
+                closing: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -125,8 +129,9 @@ impl Wedge {
             bounds: Bounds::tightened(cfg.max_duration_s, cfg.max_latency_ms, cfg.max_loss_pct, cfg.max_memory_pct_of_limit, cfg.max_live_faults),
             exclusions: Exclusions::with(&cfg.exclude_namespaces, &cfg.exclude_services),
         };
-        if settings.fleet.is_empty() {
-            return Err("Config.fleet is empty".into());
+        // It names the journal's directory: a DNS label, as a deployment name is.
+        if settings.fleet.is_empty() || settings.fleet.len() > 63 || !settings.fleet.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            return Err(format!("Config.fleet {:?} is not a deployment name", settings.fleet));
         }
         let first = {
             let mut cur = self.inner.settings.lock().unwrap();
@@ -160,8 +165,11 @@ impl Wedge {
         }
     }
 
-    /// Reverts every live fault now (shutdown, and the controller's pause through DeleteFault).
+    /// Reverts every live fault now and applies none after (the wedge's shutdown).
     pub async fn revert_all(&self, why: &str) {
+        self.inner.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wait for a fault call in flight: it is live once it returns.
+        drop(self.inner.apply.lock().await);
         let entries: Vec<Entry> = self.inner.live.lock().unwrap().values().map(|l| l.entry.clone()).collect();
         for entry in entries {
             self.revert_entry(&entry, why, false).await;
@@ -179,6 +187,7 @@ impl Wedge {
     fn emit(&self, ask_or_entry: EventFields, outcome: Outcome, refusal: &str) {
         let f = ask_or_entry;
         let event = FaultEvent {
+            // Within event_id's 64 bytes: a fault id is at most 40 (valid_fault_id).
             event_id: format!("{}-{}-{}", f.tag.fault_id, outcome.as_str_name().trim_start_matches("OUTCOME_").to_lowercase(), now_ms()),
             fleet: f.tag.fleet.clone(),
             namespace: f.target.namespace.clone(),
@@ -188,7 +197,7 @@ impl Wedge {
             service: f.service,
             parameters: Some(f.params),
             outcome: outcome as i32,
-            refusal: refusal.into(),
+            refusal: bounded(refusal),
             start_unix_ms: f.start,
             end_unix_ms: f.end,
             recorded_by: chaos_policy::WEDGE.into(),
@@ -210,7 +219,7 @@ impl Wedge {
             start_unix_ms: now,
             end_unix_ms: now,
             outcome: Outcome::Refused as i32,
-            refusal: why.clone(),
+            refusal: bounded(&why),
             ..Default::default()
         };
         self.emit(EventFields::from_ask(&ask, String::new(), now, now), Outcome::Refused, &why);
@@ -225,6 +234,9 @@ impl Wedge {
         }
         if settings.fleet.is_empty() {
             return Err(refusal("the wedge has no Config yet"));
+        }
+        if self.inner.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(refusal("the wedge is shutting down"));
         }
         if ask.tag.fleet != settings.fleet {
             return Err(format!("fleet {:?} is not this wedge's fleet {}", ask.tag.fleet, settings.fleet));
@@ -282,7 +294,7 @@ impl Wedge {
         let p = ask.params.clone();
         if ask.kind == FaultKind::ContainerKill {
             if let Err(e) = self.inner.runtime.stop_container(&resolved.container_id).await {
-                return self.refuse(ask, format!("the runtime did not stop the container: {e}"));
+                return self.refuse(ask, format!("StopContainer failed (the container may have been stopped all the same): {e}"));
             }
             self.emit(EventFields::from_ask(&Ask { target: target.clone(), ..ask_clone(&ask) }, resolved.service.clone(), start, start), Outcome::Injected, "");
             return reply(&ask.tag, ask.kind, &target, start, 0, Outcome::Injected);
@@ -293,7 +305,7 @@ impl Wedge {
                 Ok(netns_inode) => Effect::Netem { pid: resolved.sandbox_pid, netns_inode },
                 Err(e) => return self.refuse(ask, e),
             },
-            // The stress process does not exist yet; its entry is written once it does (below).
+            // The stress process does not exist yet; its pid is recorded once it does (below).
             _ => Effect::Stress { pid: 0, start_ticks: 0 },
         };
         let mut entry = Entry {
@@ -330,7 +342,11 @@ impl Wedge {
             _ => {
                 let memory_bytes = resolved.memory_limit_bytes.unwrap_or(0) / 100 * p.memory_pct_of_limit as u64;
                 let spec = StressSpec { cpu_workers: p.cpu_workers, cpu_load_pct: p.cpu_load_pct, memory_bytes, duration_s: p.duration_s };
-                // The stress process ends itself at its end even with no journal entry (src/stress.rs).
+                // Journalled before it starts (with no pid yet: a crash before the pid is recorded leaves an
+                // entry whose revert finds nothing, and the stress process ends itself at its end).
+                if let Err(e) = journal.write(&entry) {
+                    return self.refuse(ask, format!("journal: {e}"));
+                }
                 match self.inner.kernel.start_stress(&resolved.cgroup_dir, spec).await {
                     Ok(StressProcess { pid, start_ticks }) => {
                         entry.effect = Effect::Stress { pid, start_ticks };
@@ -387,6 +403,7 @@ impl Wedge {
     /// another path already (its timer, a DeleteFault, the shutdown), unless it comes from the journal of a
     /// previous wedge. A revert that fails stays journalled and live, and is tried again shortly.
     async fn revert_entry(&self, entry: &Entry, why: &str, from_journal: bool) -> Option<FaultReply> {
+        let _one_at_a_time = self.inner.apply.lock().await;
         let live = self.inner.live.lock().unwrap().remove(&entry.fault_id);
         let kind = FaultKind::try_from(entry.kind).unwrap_or_default();
         match live {
@@ -419,6 +436,15 @@ impl Wedge {
             }
         }
     }
+}
+
+/// A refusal within the record's 512 bytes (a runtime's or tc's error can be longer).
+fn bounded(why: &str) -> String {
+    let mut end = why.len().min(500);
+    while !why.is_char_boundary(end) {
+        end -= 1;
+    }
+    why[..end].to_string()
 }
 
 fn ask_clone(a: &Ask) -> Ask {
@@ -510,6 +536,8 @@ impl WedgeHandler for Wedge {
         if tag.fleet != self.settings().fleet {
             return Err(tonic::Status::permission_denied(format!("fleet {:?} is not this wedge's fleet", tag.fleet)));
         }
+        // A fault call in flight is live once it returns: wait for it.
+        drop(self.inner.apply.lock().await);
         let entry = self.inner.live.lock().unwrap().get(&tag.fault_id).map(|l| l.entry.clone());
         let Some(entry) = entry else {
             // Gone already: reverting it is success.

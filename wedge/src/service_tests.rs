@@ -489,3 +489,26 @@ async fn a_failed_revert_is_tried_again() {
     assert!(h.kernel.netem.lock().unwrap().is_empty(), "tried again and reverted");
     assert_eq!(h.outcomes(), [("x".to_string(), Outcome::Injected), ("x".to_string(), Outcome::Reverted)]);
 }
+
+/// The shutdown reverts what is live and applies nothing after it.
+#[tokio::test]
+async fn nothing_is_applied_after_the_shutdown() {
+    let h = Harness::start().await;
+    assert_eq!(Outcome::try_from(h.delay("chaos-controller", "s1", target("tac-prod", "stratum-0"), 10, 300).await.outcome).unwrap(), Outcome::Injected);
+    h.wedge.revert_all("the wedge's shutdown").await;
+    assert!(h.kernel.netem.lock().unwrap().is_empty());
+    let late = h.delay("chaos-controller", "s2", target("tac-prod", "stratum-1"), 10, 300).await;
+    assert!(late.refusal.contains("shutting down"), "{}", late.refusal);
+    assert!(h.kernel.netem.lock().unwrap().is_empty());
+}
+
+/// The fleet names the journal's directory, so it must be a deployment name.
+#[tokio::test]
+async fn the_fleet_must_be_a_deployment_name() {
+    let (runtime, namespaces, kernel) = node();
+    let dir = tempfile::tempdir().unwrap();
+    let wedge = Wedge::new(NODE.into(), dir.path().to_path_buf(), Arc::new(runtime), Arc::new(namespaces), Arc::new(kernel), Arc::new(|_| {}));
+    for bad in ["", "../x", "/abs", "Prod", "a/b"] {
+        assert!(wedge.configure(&Config { fleet: bad.into(), ..Default::default() }).await.is_err(), "{bad:?}");
+    }
+}

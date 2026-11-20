@@ -1,0 +1,7 @@
+# The compiler line this repository builds with (chaos#2). The floor follows the
+# latest released MAJOR.MINOR line, and the looper runs that line's latest patch
+# (tacplus-dev/tacplus#161). Main has no protos yet (the controller comes with
+# #1), so there is nothing to build: the file names the floor, and tacplus.lock
+# (`tacplus pin`) the exact release and build image within it that `just gates`
+# and the build pipeline run.
+tacplus: "2.6"
